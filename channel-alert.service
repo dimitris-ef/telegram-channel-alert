@@ -1,5 +1,5 @@
 [Unit]
-Description=Telegram channel alert (calls your phone on new posts)
+Description=Telegram channel alert (Pushover alarm on new posts)
 After=network-online.target
 Wants=network-online.target
 

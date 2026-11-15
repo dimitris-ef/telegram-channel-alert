@@ -1,18 +1,21 @@
-"""Ring your phone (as a Telegram voice call) whenever a Telegram channel posts.
+"""Alarm your iPhone (Pushover) whenever one of your Telegram channels posts.
 
-Watches one channel with your own Telegram account (Telethon). On every new post
-it asks CallMeBot to place a Telegram call to you that reads the post aloud.
+Watches one or more channels with your own Telegram account (Telethon). On a new
+post it sends a Pushover alert. With emergency priority the alert bypasses the
+iPhone's silent switch / Focus (Critical Alerts) and repeats until you acknowledge it.
 
 Usage:
     python channel_alert.py          # run the watcher (first run asks you to log in)
-    python channel_alert.py --test   # place one test call right now and exit
+    python channel_alert.py --test   # send one test alert right now and exit
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -21,6 +24,7 @@ from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaWebPage
 
 HERE = Path(__file__).resolve().parent
+PUSHOVER_URL = "https://api.pushover.net/1/messages.json"
 
 
 def load_config(path: Path) -> None:
@@ -35,21 +39,36 @@ def load_config(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def split_list(value: str) -> list:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 load_config(HERE / "config.env")
 
+# Telegram
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-CHANNEL = os.environ["CHANNEL"]
-CALL_USER = os.environ["CALL_USER"]
-CALL_LANG = os.environ.get("CALL_LANG", "en-GB-Standard-B")
-CALL_PREFIX = os.environ.get("CALL_PREFIX", "New post in the channel.")
+CHANNELS = split_list(os.environ.get("CHANNELS", ""))
+if not CHANNELS:
+    sys.exit("Set CHANNELS in config.env (one or more channels, comma separated).")
+
+# Pushover
+PUSHOVER_TOKEN = os.environ["PUSHOVER_TOKEN"]
+PUSHOVER_USER = os.environ["PUSHOVER_USER"]
+PRIORITY = int(os.environ.get("PUSHOVER_PRIORITY", "2"))
+RETRY_SECONDS = max(30, int(os.environ.get("PUSHOVER_RETRY", "30")))        # Pushover minimum: 30
+EXPIRE_SECONDS = min(10800, int(os.environ.get("PUSHOVER_EXPIRE", "1800")))  # Pushover maximum: 3 h
+SOUND = os.environ.get("PUSHOVER_SOUND", "").strip()
+if PRIORITY not in (-2, -1, 0, 1, 2):
+    sys.exit("PUSHOVER_PRIORITY must be -2, -1, 0, 1 or 2.")
+
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "120"))
 
-# Which kinds of post ring you. "all", or a comma list of the kinds below.
+# Which kinds of post alert you. "all", or a comma list of the kinds below.
 POST_KINDS = ("text", "photo", "video", "gif", "file", "audio", "voice", "poll")
-TRIGGER_ON = {k.strip().lower() for k in os.environ.get("TRIGGER_ON", "all").split(",") if k.strip()}
-# Optional: only ring when the text/caption contains one of these words (case-insensitive).
-KEYWORDS = [w.strip().lower() for w in os.environ.get("KEYWORDS", "").split(",") if w.strip()]
+TRIGGER_ON = {k.lower() for k in split_list(os.environ.get("TRIGGER_ON", "all"))}
+# Optional: only alert when the text/caption contains one of these words (case-insensitive).
+KEYWORDS = [w.lower() for w in split_list(os.environ.get("KEYWORDS", ""))]
 
 _unknown = TRIGGER_ON - set(POST_KINDS) - {"all"}
 if _unknown or not TRIGGER_ON:
@@ -62,24 +81,38 @@ logging.basicConfig(
 log = logging.getLogger("channel-alert")
 
 
-def place_call(text: str) -> str:
-    """Ask CallMeBot to call CALL_USER on Telegram and read `text` aloud."""
-    query = urllib.parse.urlencode({
-        "user": CALL_USER,
-        "text": text[:256],   # CallMeBot reads at most 256 characters
-        "lang": CALL_LANG,
-        "rpt": "2",           # read the message twice
-        "cc": "yes",          # also send the text as a message
-    })
-    last_error = None
-    for scheme in ("https", "http"):
-        url = f"{scheme}://api.callmebot.com/start.php?{query}"
+def send_alert(title: str, message: str, url: str = None) -> dict:
+    """Send a Pushover notification. Retries a few times on network errors."""
+    data = {
+        "token": PUSHOVER_TOKEN,
+        "user": PUSHOVER_USER,
+        "title": title[:250],
+        "message": (message or "(no text)")[:1024],
+        "priority": str(PRIORITY),
+    }
+    if PRIORITY == 2:  # emergency: repeat until acknowledged
+        data["retry"] = str(RETRY_SECONDS)
+        data["expire"] = str(EXPIRE_SECONDS)
+    if SOUND:
+        data["sound"] = SOUND
+    if url:
+        data["url"] = url[:512]
+        data["url_title"] = "Open in Telegram"
+
+    body = urllib.parse.urlencode(data).encode()
+    for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(url, timeout=90) as resp:
-                return resp.read().decode("utf-8", "replace")
-        except Exception as exc:  # try the other scheme, then give up
-            last_error = exc
-    raise RuntimeError(f"CallMeBot request failed: {last_error}")
+            req = urllib.request.Request(PUSHOVER_URL, data=body, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:  # Pushover said no (bad key etc.) - retrying won't help
+            detail = exc.read().decode("utf-8", "replace")
+            raise RuntimeError(f"Pushover rejected the alert (HTTP {exc.code}): {detail}") from None
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt == 3:
+                raise RuntimeError(f"Could not reach Pushover: {exc}") from None
+            log.warning("Network problem reaching Pushover (%s), retrying...", exc)
+            time.sleep(5)
 
 
 def post_kinds(msg) -> set:
@@ -105,13 +138,21 @@ def post_kinds(msg) -> set:
     return kinds
 
 
-def should_ring(msg) -> bool:
+def should_alert(msg) -> bool:
     if "all" not in TRIGGER_ON and not (post_kinds(msg) & TRIGGER_ON):
         return False
     if KEYWORDS:
         text = (msg.raw_text or "").lower()
         return any(word in text for word in KEYWORDS)
     return True
+
+
+def post_link(chat, msg_id: int) -> str:
+    """t.me link that opens the post in Telegram."""
+    username = getattr(chat, "username", None)
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    return f"https://t.me/c/{chat.id}/{msg_id}"  # private channel (works for members)
 
 
 def channel_ref(value: str):
@@ -121,43 +162,52 @@ def channel_ref(value: str):
 
 async def main() -> None:
     if "--test" in sys.argv:
-        log.info("Placing a test call to %s ...", CALL_USER)
-        log.info("CallMeBot replied: %s", place_call("This is a test call from your channel alert.")[:300])
+        log.info("Sending a test alert (priority %s)...", PRIORITY)
+        result = send_alert("Channel alert test", "If you can read this, Pushover works. Tap Acknowledge to stop it.")
+        log.info("Pushover replied: %s", result)
         return
 
     client = TelegramClient(str(HERE / "watcher"), API_ID, API_HASH)
     await client.start()  # first run: asks for your phone number and login code
 
-    channel = await client.get_entity(channel_ref(CHANNEL))
-    log.info("Watching channel: %s", getattr(channel, "title", CHANNEL))
-    log.info("Ringing on: %s%s", ", ".join(sorted(TRIGGER_ON)),
-             f" | keywords: {', '.join(KEYWORDS)}" if KEYWORDS else "")
+    channels = []
+    for ref in CHANNELS:
+        try:
+            channels.append(await client.get_entity(channel_ref(ref)))
+        except Exception as exc:
+            sys.exit(f"Could not find channel {ref!r}: {exc}. Check the name and that you have joined it.")
+    for ch in channels:
+        log.info("Watching: %s", getattr(ch, "title", ch.id))
+    log.info("Alerting on: %s%s | priority %s", ", ".join(sorted(TRIGGER_ON)),
+             f" | keywords: {', '.join(KEYWORDS)}" if KEYWORDS else "", PRIORITY)
 
-    last_call = 0.0
+    last_alert = {}  # channel id -> time of last alert (cooldown is per channel)
 
-    @client.on(events.NewMessage(chats=channel))
+    @client.on(events.NewMessage(chats=channels))
     async def on_post(event):
-        nonlocal last_call
+        chat = await event.get_chat()
+        title = getattr(chat, "title", "Telegram channel")
         kinds = post_kinds(event.message)
         kind_names = ", ".join(sorted(kinds)) or "other"
         text = (event.raw_text or "").strip() or f"A new {kind_names} was posted."
-        log.info("New post [%s]: %s", kind_names, text[:120].replace("\n", " "))
+        log.info("[%s] new post [%s]: %s", title, kind_names, text[:120].replace("\n", " "))
 
-        if not should_ring(event.message):
-            log.info("Filtered out, not calling")
+        if not should_alert(event.message):
+            log.info("Filtered out, no alert")
             return
 
         now = time.monotonic()
-        if now - last_call < COOLDOWN_SECONDS:
-            log.info("Skipping call (already called %.0fs ago)", now - last_call)
+        since = now - last_alert.get(chat.id, float("-inf"))
+        if since < COOLDOWN_SECONDS:
+            log.info("Skipping alert (already alerted for this channel %.0fs ago)", since)
             return
-        last_call = now
+        last_alert[chat.id] = now
 
         try:
-            reply = await asyncio.to_thread(place_call, f"{CALL_PREFIX} {text}")
-            log.info("Call requested. CallMeBot replied: %s", reply[:300])
+            await asyncio.to_thread(send_alert, title, text, post_link(chat, event.id))
+            log.info("Alert sent")
         except Exception:
-            log.exception("Could not place the call")
+            log.exception("Could not send the alert")
 
     await client.run_until_disconnected()
 
