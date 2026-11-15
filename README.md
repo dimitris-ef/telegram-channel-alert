@@ -17,7 +17,7 @@ The phone rings like a real call. You can filter which posts ring you (only phot
 Clone the repo to a **short path** (long paths break the install on Windows):
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/telegram-channel-alert.git C:\channel-alert
+git clone https://github.com/dimitris-ef/telegram-channel-alert.git C:\channel-alert
 ```
 
 Then, in that folder:
