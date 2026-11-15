@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram channel alert (calls your phone on new posts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=alert
+WorkingDirectory=/opt/channel-alert
+ExecStart=/opt/channel-alert/venv/bin/python /opt/channel-alert/channel_alert.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

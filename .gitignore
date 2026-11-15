@@ -1,0 +1,10 @@
+# Secrets - never commit these
+config.env
+*.session
+*.session-journal
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
